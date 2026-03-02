@@ -93,7 +93,7 @@ static struct {
     int par[MAX_PAR]; int np;
     float *cm[MAX_PAR], *cv[MAX_PAR]; int cstep;
     int on;
-} T;
+} T; 
 
 static float *aalloc(size_t n) {
     size_t b = n * sizeof(float), al = (T.apos + 15) & ~(size_t)15;
