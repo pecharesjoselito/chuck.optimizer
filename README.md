@@ -1,4 +1,4 @@
-# Chuck
+# Chuck Optimizer
 
 **Adam with self-awareness.**
 
