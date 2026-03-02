@@ -1,30 +1,33 @@
 /*
- * micro_vlm.c v3 — Vision-Language Model in pure C
+ * micro_vlm.c v4 — Vision-Language Model in pure C
  *
  * Sees images. Speaks words. Zero dependencies beyond libc/libm.
  * Tape-based autograd with arena bump allocator.
  *
  * Architecture:
- *   ViT-style patch tokenization → RoPE → multi-head causal attention →
+ *   ViT-style patch tokenization → RoPE → GQA multi-head causal attention →
  *   SwiGLU MLP → RMSNorm → weight-tied lm_head → text
  *
- * What's inside:
- *   - Patch embedding: 4x4 patches → N_EMBD tokens (each patch sees different space)
- *   - Rotary Position Embeddings (RoPE) — no learned positional parameters
- *   - Multi-head causal attention with KV cache and full backward pass
- *   - SwiGLU MLP, RMSNorm, residual connections (Llama-style)
- *   - The Chuck optimizer — Adam + self-awareness:
- *       θ -= (α × λ) × m̂/(√v̂ + ε) + η
- *       λ = self_modulate(loss_history)  — reactive dampen/boost from loss trend
- *       η = stagnation_noise()           — escape local minima when plateaued
- *       Chuck watches his own loss. Dampens when hurting. Boosts when winning.
- *       Injects noise when stuck. Adam doesn't do this. Chuck does.
- *   - Cosine LR with warmup, top-k temperature sampling
- *   - Arena bump allocator (64MB, zero malloc in hot path)
- *   - xoshiro256** PRNG, Box-Muller normal sampling
+ * v4 changes over v3:
+ *   - GQA (Grouped Query Attention): 4 Q-heads, 2 KV-heads, ratio 2:1
+ *   - 3 transformer layers (was 2), 105K params (was 75K)
+ *   - Per-head RoPE (correct Llama-style, not the v3 per-tensor version)
+ *   - Chuck v4: self-awareness at every level:
+ *       θ_l -= (α × λ × λ_l × σ) × m̂/(√v̂ + ε) + η
+ *       λ   = global self-modulation (loss trend)
+ *       λ_l = per-layer self-modulation (grad norm trend for layer l)
+ *       σ   = activation health signal (SiLU alive × norm stability)
+ *       η   = stagnation noise (escape local minima)
+ *       Every component has eyes. Adam is blind. Chuck sees.
+ *   - Self-aware SiLU: tracks dead neuron ratio
+ *   - Self-aware RMSNorm: tracks normalization scale EMA
+ *   - Self-aware RoPE: tracks frequency band utilization
+ *   - Cross-layer signal flow: detects vanishing/exploding activations
+ *   - Per-layer freeze: Chuck stops updating converged layers (zero waste)
  *
  * Inspired by sailfish009/purevlm (Python VLM).
- * This is the C answer: same idea, different language, tape autograd.
+ * This is the C answer: same idea, different language, tape autograd,
+ * and an optimizer that watches itself think.
  *
  * Build: cc -std=c11 -O2 -march=native -o micro_vlm micro_vlm.c -lm
  * Run:   ./micro_vlm
@@ -49,8 +52,11 @@
 #define SEQ_LEN        (N_VIS + MAX_TXT)
 #define N_EMBD         48
 #define N_HEAD         4
+#define N_KV_HEAD      2
+#define N_KV_GROUP     (N_HEAD / N_KV_HEAD)
 #define HEAD_DIM       (N_EMBD / N_HEAD)
-#define N_LAYER        2
+#define KV_DIM         (N_KV_HEAD * HEAD_DIM)
+#define N_LAYER        3
 #define MLP_DIM        (4 * N_EMBD)
 #define VOCAB          17
 #define BOS            15
@@ -69,7 +75,7 @@
 #define CHUCK_DAMP_LO  0.1f
 #define CHUCK_DAMP_HI  2.0f
 
-#define ARENA_SZ       (64 * 1024 * 1024)
+#define ARENA_SZ       (96 * 1024 * 1024)
 #define MAX_ARR        16384
 #define MAX_ENT        32768
 #define MAX_PAR        128
@@ -138,7 +144,47 @@ static float rnf(float mu, float s) {
 }
 static inline float sigf(float x) { return 1.0f / (1.0f + expf(-x)); }
 
-/* ---- Forward ops ---- */
+/* ---- Self-Awareness: Eyes ---- */
+
+/* SiLU eye: tracks dead neuron ratio */
+static struct { int dead, total; float health; } SiLU_eye;
+
+static void silu_eye_reset(void) { SiLU_eye.dead = 0; SiLU_eye.total = 0; }
+static void silu_eye_update(void) {
+    if (SiLU_eye.total == 0) { SiLU_eye.health = 1.0f; return; }
+    SiLU_eye.health = 1.0f - (float)SiLU_eye.dead / SiLU_eye.total;
+    SiLU_eye.dead = 0; SiLU_eye.total = 0;
+}
+
+/* RMSNorm eye: tracks normalization scale EMA */
+static struct { float scale_ema; int init; } Norm_eye;
+
+/* RoPE eye: tracks frequency band utilization */
+static struct { float freq_energy[N_EMBD/2]; int calls; float utilization; } RoPE_eye;
+
+static void rope_eye_reset(void) {
+    memset(RoPE_eye.freq_energy, 0, sizeof(RoPE_eye.freq_energy));
+    RoPE_eye.calls = 0;
+}
+static void rope_eye_update(void) {
+    if (RoPE_eye.calls == 0) return;
+    float max_e = 0;
+    for (int b = 0; b < HEAD_DIM/2; b++) {
+        RoPE_eye.freq_energy[b] /= RoPE_eye.calls;
+        if (RoPE_eye.freq_energy[b] > max_e) max_e = RoPE_eye.freq_energy[b];
+    }
+    int active = 0;
+    for (int b = 0; b < HEAD_DIM/2; b++)
+        if (RoPE_eye.freq_energy[b] > max_e * 0.01f) active++;
+    RoPE_eye.utilization = (HEAD_DIM/2 > 0) ? (float)active / (HEAD_DIM/2) : 1.0f;
+    memset(RoPE_eye.freq_energy, 0, sizeof(RoPE_eye.freq_energy));
+    RoPE_eye.calls = 0;
+}
+
+/* Cross-layer signal flow */
+static float act_mag[N_LAYER];
+
+/* ---- Forward ops (with awareness tracking) ---- */
 static int op_add(int xi, int yi) {
     int n = T.a[xi].size, zi = anew(n);
     for (int i = 0; i < n; i++) T.a[zi].data[i] = T.a[xi].data[i] + T.a[yi].data[i];
@@ -165,11 +211,20 @@ static int op_rms(int xi) {
     for (int i = 0; i < n; i++) ms += T.a[xi].data[i] * T.a[xi].data[i];
     ms = ms / n + 1e-5f; float sc = 1.0f / sqrtf(ms);
     for (int i = 0; i < n; i++) T.a[zi].data[i] = T.a[xi].data[i] * sc;
+    /* Norm eye: track scale */
+    if (Norm_eye.init) Norm_eye.scale_ema = 0.99f * Norm_eye.scale_ema + 0.01f * sc;
+    else { Norm_eye.scale_ema = sc; Norm_eye.init = 1; }
     rec(OP_RMSNORM,zi,xi,-1,sc,n); return zi;
 }
 static int op_silu(int xi) {
     int n = T.a[xi].size, zi = anew(n);
-    for (int i = 0; i < n; i++) { float s = sigf(T.a[xi].data[i]); T.a[zi].data[i] = T.a[xi].data[i] * s; }
+    for (int i = 0; i < n; i++) {
+        float x = T.a[xi].data[i]; float s = sigf(x);
+        T.a[zi].data[i] = x * s;
+        /* SiLU eye: track dead zone */
+        if (x < -4.0f) SiLU_eye.dead++;
+        SiLU_eye.total++;
+    }
     rec(OP_SILU,zi,xi,-1,0,0); return zi;
 }
 static int op_embed(int Wi, int id) {
@@ -190,11 +245,20 @@ static int op_rope(int xi, int pos) {
     int n = T.a[xi].size, zi = anew(n);
     memcpy(T.a[zi].data, T.a[xi].data, n * sizeof(float));
     float *d = T.a[zi].data;
-    for (int i = 0; i < n; i += 2) {
-        float freq = 1.0f / powf(ROPE_BASE, (float)i / (float)n);
-        float ang = pos * freq, c = cosf(ang), s = sinf(ang);
-        float x0 = d[i], x1 = d[i+1]; d[i] = x0*c - x1*s; d[i+1] = x0*s + x1*c;
+    int n_heads = n / HEAD_DIM;
+    for (int h = 0; h < n_heads; h++) {
+        for (int i = 0; i < HEAD_DIM; i += 2) {
+            float freq = 1.0f / powf(ROPE_BASE, (float)i / (float)HEAD_DIM);
+            float ang = pos * freq, c = cosf(ang), s = sinf(ang);
+            int idx = h * HEAD_DIM + i;
+            float x0 = d[idx], x1 = d[idx+1];
+            d[idx] = x0*c - x1*s; d[idx+1] = x0*s + x1*c;
+            /* RoPE eye: track frequency energy */
+            float energy = d[idx]*d[idx] + d[idx+1]*d[idx+1];
+            if (i/2 < N_EMBD/2) RoPE_eye.freq_energy[i/2] += energy;
+        }
     }
+    RoPE_eye.calls++;
     rec(OP_ROPE,zi,xi,-1,0,pos); return zi;
 }
 static int op_reduce(int *la, int n) {
@@ -204,7 +268,7 @@ static int op_reduce(int *la, int n) {
     rec(OP_REDUCE,zi,buf,-1,0,n); return zi;
 }
 
-/* ---- KV cache ---- */
+/* ---- KV cache (GQA: KV_DIM, not N_EMBD) ---- */
 static float *kv_k[N_LAYER][SEQ_LEN], *kv_v[N_LAYER][SEQ_LEN];
 static int kv_ki[N_LAYER][SEQ_LEN], kv_vi[N_LAYER][SEQ_LEN];
 static void kv_clear(void) {
@@ -238,28 +302,41 @@ static void backward(int loss) {
         case OP_EMBED: { int id = e->ai, c = i1->cols;
             for (int j = 0; j < c; j++) i1->grad[id*c+j] += out->grad[j]; break; }
         case OP_ROPE: { int n = out->size, pos = e->ai;
-            for (int i = 0; i < n; i += 2) { float freq = 1.0f / powf(ROPE_BASE, (float)i/(float)n);
-                float ang = pos*freq, c = cosf(ang), s = sinf(ang);
-                float g0 = out->grad[i], g1 = out->grad[i+1];
-                i1->grad[i] += g0*c + g1*s; i1->grad[i+1] += -g0*s + g1*c; } break; }
-        case OP_ATTN: { int li = (int)e->aux, pos = e->ai;
+            int nh = n / HEAD_DIM;
+            for (int h = 0; h < nh; h++) {
+                for (int i = 0; i < HEAD_DIM; i += 2) {
+                    float freq = 1.0f / powf(ROPE_BASE, (float)i/(float)HEAD_DIM);
+                    float ang = pos*freq, c = cosf(ang), s = sinf(ang);
+                    int idx = h * HEAD_DIM + i;
+                    float g0 = out->grad[idx], g1 = out->grad[idx+1];
+                    i1->grad[idx] += g0*c + g1*s; i1->grad[idx+1] += -g0*s + g1*c;
+                }
+            } break; }
+        case OP_ATTN: { /* GQA attention backward */
+            int li = (int)e->aux, pos = e->ai;
             float *qd = i1->data, *ag = out->grad, isq = 1.0f / sqrtf((float)HEAD_DIM);
-            for (int h = 0; h < N_HEAD; h++) { int hs = h * HEAD_DIM;
+            for (int h = 0; h < N_HEAD; h++) {
+                int hs = h * HEAD_DIM;
+                int kvh = h / N_KV_GROUP;
+                int kvs = kvh * HEAD_DIM;
                 float sc[SEQ_LEN], mx = -1e9f;
                 for (int t = 0; t <= pos; t++) { float s = 0;
-                    for (int d = 0; d < HEAD_DIM; d++) s += qd[hs+d]*kv_k[li][t][hs+d];
+                    for (int d = 0; d < HEAD_DIM; d++) s += qd[hs+d]*kv_k[li][t][kvs+d];
                     sc[t] = s*isq; if (sc[t] > mx) mx = sc[t]; }
                 float sm = 0; for (int t = 0; t <= pos; t++) { sc[t] = expf(sc[t]-mx); sm += sc[t]; }
                 for (int t = 0; t <= pos; t++) sc[t] /= (sm + 1e-10f);
                 float dw[SEQ_LEN];
                 for (int t = 0; t <= pos; t++) { dw[t] = 0;
-                    for (int d = 0; d < HEAD_DIM; d++) dw[t] += kv_v[li][t][hs+d]*ag[hs+d]; }
+                    for (int d = 0; d < HEAD_DIM; d++) dw[t] += kv_v[li][t][kvs+d]*ag[hs+d]; }
                 float dot = 0; for (int t = 0; t <= pos; t++) dot += sc[t]*dw[t];
                 for (int t = 0; t <= pos; t++) { float ds = sc[t]*(dw[t]-dot);
                     for (int d = 0; d < HEAD_DIM; d++) {
-                        i1->grad[hs+d] += ds * kv_k[li][t][hs+d] * isq;
-                        T.a[kv_ki[li][t]].grad[hs+d] += ds * qd[hs+d] * isq;
-                        T.a[kv_vi[li][t]].grad[hs+d] += sc[t] * ag[hs+d];
+                        /* grad Q: each Q-head gets its own gradient */
+                        i1->grad[hs+d] += ds * kv_k[li][t][kvs+d] * isq;
+                        /* grad K: multiple Q-heads accumulate to shared KV-head */
+                        T.a[kv_ki[li][t]].grad[kvs+d] += ds * qd[hs+d] * isq;
+                        /* grad V: multiple Q-heads accumulate to shared KV-head */
+                        T.a[kv_vi[li][t]].grad[kvs+d] += sc[t] * ag[hs+d];
                     } }
             } break; }
         case OP_REDUCE: { int n = e->ai; int *idxs = (int*)i1->data; float dl = out->grad[0]/n;
@@ -268,20 +345,58 @@ static void backward(int loss) {
     }
 }
 
-/* The Chuck optimizer: Adam + self-awareness.
- *   θ -= (α × λ) × m̂/(√v̂ + ε) + η
- * λ = dampen/boost from loss trend.  η = noise injection on stagnation.
- * Chuck watches his own loss curve. Dampens when diverging. Boosts when
- * converging. Injects noise to escape plateaus. Adam is blind. Chuck sees.
- * "Chuck doesn't follow gradients. Gradients follow Chuck." */
+/* ===========================================================================
+ * Chuck v4: Self-Aware Optimizer
+ *
+ *   θ_l -= (α × λ × λ_l × σ) × m̂/(√v̂ + ε) + η
+ *
+ *   λ   = global self-modulation (loss trend over 16-step window)
+ *   λ_l = per-layer self-modulation (gradient norm trend per layer)
+ *   σ   = activation health signal (SiLU alive ratio × norm stability)
+ *   η   = stagnation noise (only when globally stuck)
+ *   α   = base learning rate from cosine schedule
+ *
+ *   If λ_l = 0 → layer is frozen. Zero compute waste. Chuck decided it's done.
+ *   Adam doesn't know which layers are done. Chuck does.
+ * =========================================================================== */
+
+/* Per-layer awareness state */
+typedef struct {
+    float grad_hist[CHUCK_WINDOW];
+    float dampen;
+    int frozen;
+    int pos, full, stag;
+} ChuckLayer;
+
+/* Global awareness state */
 static struct {
     float hist[CHUCK_WINDOW];
-    float dampen, noise;
+    float dampen, noise, sigma;
     int pos, full, stag;
-} Chuck = { .dampen = 1.0f };
+} Chuck;
+
+static ChuckLayer CL[N_LAYER];
+
+static void chuck_init(void) {
+    memset(&Chuck, 0, sizeof(Chuck));
+    Chuck.dampen = 1.0f; Chuck.sigma = 1.0f;
+    for (int l = 0; l < N_LAYER; l++) {
+        memset(&CL[l], 0, sizeof(ChuckLayer));
+        CL[l].dampen = 1.0f;
+    }
+    Norm_eye.init = 0; Norm_eye.scale_ema = 1.0f;
+    SiLU_eye.health = 1.0f;
+    RoPE_eye.utilization = 1.0f;
+}
+
+/* Which layer does param pi belong to? -1 = global (patch_proj, wte) */
+static int param_layer(int pi) {
+    if (pi < 2) return -1;  /* 0=patch_proj, 1=wte */
+    return (pi - 2) / 7;     /* 7 params per layer: wq,wk,wv,wo,w1,w3,w2 */
+}
 
 static void chuck_step(float lr, float loss) {
-    /* === Self-awareness: reflect on own performance === */
+    /* ═══ Level 1: Global self-awareness (loss trend) ═══ */
     Chuck.hist[Chuck.pos % CHUCK_WINDOW] = loss;
     Chuck.pos++;
     if (Chuck.pos >= CHUCK_WINDOW) Chuck.full = 1;
@@ -294,8 +409,8 @@ static void chuck_step(float lr, float loss) {
         }
         recent /= q; old /= q;
         float trend = (recent - old) / (old + 1e-8f);
-        if (trend > 0.01f) Chuck.dampen *= 0.95f;        /* diverging → dampen */
-        else if (trend < -0.05f) Chuck.dampen *= 1.05f;   /* converging → boost */
+        if (trend > 0.01f) Chuck.dampen *= 0.95f;        /* loss rising → dampen */
+        else if (trend < -0.05f) Chuck.dampen *= 1.05f;   /* loss falling → boost */
         if (fabsf(trend) < 0.001f) {
             Chuck.stag++;
             if (Chuck.stag > 8) { Chuck.noise = 0.001f; Chuck.stag = 0; }
@@ -303,22 +418,96 @@ static void chuck_step(float lr, float loss) {
         if (Chuck.dampen < CHUCK_DAMP_LO) Chuck.dampen = CHUCK_DAMP_LO;
         if (Chuck.dampen > CHUCK_DAMP_HI) Chuck.dampen = CHUCK_DAMP_HI;
     }
-    float eff_lr = lr * Chuck.dampen;
 
-    /* === Momentum update (Adam core) + noise injection === */
-    T.cstep++; float bc1 = 1.0f - powf(CHUCK_B1, T.cstep), bc2 = 1.0f - powf(CHUCK_B2, T.cstep);
+    /* ═══ Level 4: Activation health signal (σ) ═══ */
+    silu_eye_update();
+    rope_eye_update();
+    Chuck.sigma = 1.0f;
+    if (SiLU_eye.health < 0.7f) Chuck.sigma *= SiLU_eye.health / 0.7f;
+    if (Norm_eye.scale_ema > 5.0f) Chuck.sigma *= 0.9f;
+    if (Norm_eye.scale_ema < 0.2f) Chuck.sigma *= 0.9f;
+
+    /* ═══ Level 2: Per-layer self-awareness (grad norm trend) ═══ */
+    float layer_gnorm[N_LAYER];
+    memset(layer_gnorm, 0, sizeof(layer_gnorm));
+    for (int pi = 0; pi < T.np; pi++) {
+        int l = param_layer(pi);
+        if (l < 0 || l >= N_LAYER) continue;
+        Arr *p = &T.a[T.par[pi]];
+        float gn = 0;
+        for (int i = 0; i < p->size; i++) gn += p->grad[i] * p->grad[i];
+        layer_gnorm[l] += gn;
+    }
+    for (int l = 0; l < N_LAYER; l++) layer_gnorm[l] = sqrtf(layer_gnorm[l]);
+
+    for (int l = 0; l < N_LAYER; l++) {
+        if (CL[l].frozen) continue;
+        CL[l].grad_hist[CL[l].pos % CHUCK_WINDOW] = layer_gnorm[l];
+        CL[l].pos++;
+        if (CL[l].pos >= CHUCK_WINDOW) CL[l].full = 1;
+        if (CL[l].full) {
+            int q = CHUCK_WINDOW / 4;
+            float recent = 0, old = 0;
+            for (int i = 0; i < q; i++) {
+                recent += CL[l].grad_hist[(CL[l].pos - 1 - i) % CHUCK_WINDOW];
+                old += CL[l].grad_hist[(CL[l].pos - CHUCK_WINDOW + i) % CHUCK_WINDOW];
+            }
+            recent /= q; old /= q;
+            float trend = (recent - old) / (old + 1e-8f);
+            /* grad norm trending up → layer needs more work → boost */
+            if (trend > 0.05f) CL[l].dampen *= 1.05f;
+            /* grad norm trending down → layer is settling → dampen */
+            else if (trend < -0.05f) CL[l].dampen *= 0.95f;
+            /* freeze: near-zero gradient norm for extended period */
+            if (layer_gnorm[l] < 0.01f) {
+                CL[l].stag++;
+                if (CL[l].stag > 8) CL[l].frozen = 1;
+            } else { CL[l].stag = 0; }
+            if (CL[l].dampen < CHUCK_DAMP_LO) CL[l].dampen = CHUCK_DAMP_LO;
+            if (CL[l].dampen > CHUCK_DAMP_HI) CL[l].dampen = CHUCK_DAMP_HI;
+        }
+    }
+
+    /* ═══ Level 5: Cross-layer signal flow ═══ */
+    if (act_mag[0] > 1e-8f) {
+        float ratio = act_mag[N_LAYER-1] / (act_mag[0] + 1e-8f);
+        for (int l = 1; l < N_LAYER; l++) {
+            if (CL[l].frozen) continue;
+            float depth = (float)l / (N_LAYER - 1);
+            if (ratio < 0.3f) CL[l].dampen *= (1.0f + 0.02f * depth);       /* vanishing → boost deep */
+            else if (ratio > 3.0f) CL[l].dampen *= (1.0f - 0.02f * depth);  /* exploding → dampen deep */
+            if (CL[l].dampen < CHUCK_DAMP_LO) CL[l].dampen = CHUCK_DAMP_LO;
+            if (CL[l].dampen > CHUCK_DAMP_HI) CL[l].dampen = CHUCK_DAMP_HI;
+        }
+    }
+
+    /* ═══ Apply parameter updates ═══ */
+    T.cstep++;
+    float bc1 = 1.0f - powf(CHUCK_B1, (float)T.cstep);
+    float bc2 = 1.0f - powf(CHUCK_B2, (float)T.cstep);
+
+    /* Global gradient clipping */
     float gnorm_sq = 0;
     for (int pi = 0; pi < T.np; pi++) { Arr *p = &T.a[T.par[pi]];
         for (int i = 0; i < p->size; i++) gnorm_sq += p->grad[i] * p->grad[i]; }
     float gnorm = sqrtf(gnorm_sq + 1e-8f), clip = (gnorm > GRAD_CLIP) ? GRAD_CLIP / gnorm : 1.0f;
-    for (int pi = 0; pi < T.np; pi++) { int idx = T.par[pi]; Arr *p = &T.a[idx];
+
+    for (int pi = 0; pi < T.np; pi++) {
+        int l = param_layer(pi);
+        /* Frozen layer → skip entirely */
+        if (l >= 0 && l < N_LAYER && CL[l].frozen) continue;
+        float layer_damp = (l >= 0 && l < N_LAYER) ? CL[l].dampen : 1.0f;
+        float eff_lr = lr * Chuck.dampen * layer_damp * Chuck.sigma;
+
+        int idx = T.par[pi]; Arr *p = &T.a[idx];
         float *m = T.cm[pi], *v = T.cv[pi];
         for (int i = 0; i < p->size; i++) { float g = p->grad[i] * clip;
             m[i] = CHUCK_B1*m[i] + (1.0f-CHUCK_B1)*g;
             v[i] = CHUCK_B2*v[i] + (1.0f-CHUCK_B2)*g*g;
             p->data[i] -= eff_lr * (m[i]/bc1) / (sqrtf(v[i]/bc2) + CHUCK_EPS);
             if (Chuck.noise > 0) p->data[i] += Chuck.noise * rnf(0, 1.0f);
-        } }
+        }
+    }
 }
 
 /* ---- Synthetic digit data ---- */
@@ -349,7 +538,7 @@ static const char chars[] = "efghinorstuvwxz";
 static int c2id(char c) { for (int i = 0; i < N_CHARS; i++) if (chars[i] == c) return i; return -1; }
 static char id2c(int i) { return (i == BOS) ? '^' : (i == EOS) ? '$' : (i >= 0 && i < N_CHARS) ? chars[i] : '?'; }
 
-/* ---- Model ---- */
+/* ---- Model (GQA: wk/wv use KV_DIM) ---- */
 typedef struct {
     int patch_proj, wte;
     struct { int wq, wk, wv, wo, w1, w3, w2; } L[N_LAYER];
@@ -362,40 +551,59 @@ static int init_w(int r, int c, float s) {
     preg(i); return i;
 }
 static void init_model(void) {
-    M.patch_proj = init_w(N_EMBD, PATCH_PX, 0.1f);
-    M.wte = init_w(VOCAB, N_EMBD, 0.08f);
+    M.patch_proj = init_w(N_EMBD, PATCH_PX, 0.1f);        /* param 0 */
+    M.wte = init_w(VOCAB, N_EMBD, 0.08f);                  /* param 1 */
     for (int i = 0; i < N_LAYER; i++) {
         float s = 0.08f / sqrtf(2.0f * N_LAYER);
-        M.L[i].wq = init_w(N_EMBD,N_EMBD,s); M.L[i].wk = init_w(N_EMBD,N_EMBD,s);
-        M.L[i].wv = init_w(N_EMBD,N_EMBD,s); M.L[i].wo = init_w(N_EMBD,N_EMBD,s);
-        M.L[i].w1 = init_w(MLP_DIM,N_EMBD,s); M.L[i].w3 = init_w(MLP_DIM,N_EMBD,s);
-        M.L[i].w2 = init_w(N_EMBD,MLP_DIM,s);
+        M.L[i].wq = init_w(N_EMBD, N_EMBD, s);             /* param 2+7i+0 */
+        M.L[i].wk = init_w(KV_DIM, N_EMBD, s);             /* param 2+7i+1: GQA! */
+        M.L[i].wv = init_w(KV_DIM, N_EMBD, s);             /* param 2+7i+2: GQA! */
+        M.L[i].wo = init_w(N_EMBD, N_EMBD, s);             /* param 2+7i+3 */
+        M.L[i].w1 = init_w(MLP_DIM, N_EMBD, s);            /* param 2+7i+4 */
+        M.L[i].w3 = init_w(MLP_DIM, N_EMBD, s);            /* param 2+7i+5 */
+        M.L[i].w2 = init_w(N_EMBD, MLP_DIM, s);            /* param 2+7i+6 */
     }
     T.npa = T.na; T.aparam = T.apos;
 }
 
-/* ---- GPT step (one position) ---- */
-static int gpt_step(int x, int pos) {
+/* ---- GPT step (one position, GQA attention) ---- */
+static int gpt_step(int x, int pos, int layer_track) {
     int h = x;
     for (int li = 0; li < N_LAYER; li++) {
         int res = h; h = op_rms(h);
-        int qi = op_mv(M.L[li].wq, h), ki = op_mv(M.L[li].wk, h), vi = op_mv(M.L[li].wv, h);
-        int rqi = op_rope(qi, pos), rki = op_rope(ki, pos);
+        int qi = op_mv(M.L[li].wq, h);
+        int ki = op_mv(M.L[li].wk, h);  /* KV_DIM output */
+        int vi = op_mv(M.L[li].wv, h);  /* KV_DIM output */
+        int rqi = op_rope(qi, pos);
+        int rki = op_rope(ki, pos);      /* RoPE on KV_DIM */
         kv_k[li][pos] = T.a[rki].data; kv_v[li][pos] = T.a[vi].data;
         kv_ki[li][pos] = rki; kv_vi[li][pos] = vi;
+
+        /* GQA multi-head attention */
         int ao = anew(N_EMBD); float *ad = T.a[ao].data;
-        for (int h_ = 0; h_ < N_HEAD; h_++) { int hs = h_ * HEAD_DIM;
+        for (int h_ = 0; h_ < N_HEAD; h_++) {
+            int hs = h_ * HEAD_DIM;         /* Q offset in N_EMBD */
+            int kvh = h_ / N_KV_GROUP;      /* which KV head */
+            int kvs = kvh * HEAD_DIM;        /* KV offset in KV_DIM */
             float sc[SEQ_LEN], mx = -1e9f; float *qd = T.a[rqi].data;
             for (int t = 0; t <= pos; t++) { float s = 0;
-                for (int d = 0; d < HEAD_DIM; d++) s += qd[hs+d]*kv_k[li][t][hs+d];
+                for (int d = 0; d < HEAD_DIM; d++) s += qd[hs+d]*kv_k[li][t][kvs+d];
                 sc[t] = s / sqrtf((float)HEAD_DIM); if (sc[t] > mx) mx = sc[t]; }
             float sm = 0; for (int t = 0; t <= pos; t++) { sc[t] = expf(sc[t]-mx); sm += sc[t]; }
             for (int t = 0; t <= pos; t++) sc[t] /= (sm + 1e-10f);
             for (int d = 0; d < HEAD_DIM; d++) { float v = 0;
-                for (int t = 0; t <= pos; t++) v += sc[t]*kv_v[li][t][hs+d]; ad[hs+d] = v; }
+                for (int t = 0; t <= pos; t++) v += sc[t]*kv_v[li][t][kvs+d]; ad[hs+d] = v; }
         }
         rec(OP_ATTN, ao, rqi, -1, (float)li, pos);
         h = op_add(res, op_mv(M.L[li].wo, ao));
+
+        /* Track activation magnitude for cross-layer signal */
+        if (layer_track) {
+            float rms = 0;
+            for (int i = 0; i < N_EMBD; i++) rms += T.a[h].data[i] * T.a[h].data[i];
+            act_mag[li] = sqrtf(rms / N_EMBD);
+        }
+
         res = h; h = op_rms(h);
         int gate = op_silu(op_mv(M.L[li].w1, h)), up = op_mv(M.L[li].w3, h);
         h = op_add(res, op_mv(M.L[li].w2, op_mul(gate, up)));
@@ -423,10 +631,10 @@ static float cos_lr(int step, int total) {
 
 /* ---- Training ---- */
 static void train(Data *data) {
-    printf("\n=== TRAINING (%d steps, Chuck optimizer) ===\n", STEPS);
+    printf("\n=== TRAINING (%d steps, Chuck v4 — self-awareness at every level) ===\n", STEPS);
     int tp = 0; for (int i = 0; i < T.np; i++) tp += T.a[T.par[i]].size;
-    printf("  %d params (%.1fK) | %d layers | embd=%d | %dx%d patches | RoPE | weight-tied\n\n",
-           tp, tp/1000.0f, N_LAYER, N_EMBD, PATCHES_SIDE, PATCHES_SIDE);
+    printf("  %d params (%.1fK) | %d layers | GQA %dQ/%dKV | embd=%d | %dx%d patches | RoPE | weight-tied\n\n",
+           tp, tp/1000.0f, N_LAYER, N_HEAD, N_KV_HEAD, N_EMBD, PATCHES_SIDE, PATCHES_SIDE);
     float rl = 0; int rn = 0;
     for (int step = 0; step < STEPS; step++) {
         int idx = (int)(rnext() % (uint64_t)data->n); int label = data->labels[idx];
@@ -434,20 +642,35 @@ static void train(Data *data) {
         int toks[MAX_TXT+2]; int nt = 0;
         toks[nt++] = BOS; for (int i = 0; i < nlen; i++) toks[nt++] = c2id(name[i]); toks[nt++] = EOS;
         tape_reset(); kv_clear();
+        silu_eye_reset(); rope_eye_reset();
         int vt[N_VIS]; encode_vis(data->imgs[idx], vt);
-        for (int p = 0; p < N_VIS; p++) gpt_step(vt[p], p);
+        for (int p = 0; p < N_VIS; p++) gpt_step(vt[p], p, 0);
         int la[MAX_TXT]; int nl = 0;
         for (int t = 0; t < nt - 1; t++) {
             int pos = N_VIS + t, te = op_embed(M.wte, toks[t]);
-            int lg = gpt_step(te, pos); la[nl++] = op_ce(lg, toks[t+1]);
+            int lg = gpt_step(te, pos, (t == nt - 2)); /* track signal on last token */
+            la[nl++] = op_ce(lg, toks[t+1]);
         }
         int loss = op_reduce(la, nl); backward(loss);
         float lv = T.a[loss].data[0];
         chuck_step(cos_lr(step, STEPS), lv);
         rl += lv; rn++;
         if ((step+1) % 250 == 0) {
-            printf("  step %5d/%d | loss %.4f (avg %.4f) | lr %.6f | dampen %.2f | target: %s\n",
-                   step+1, STEPS, lv, rl/rn, cos_lr(step,STEPS)*Chuck.dampen, Chuck.dampen, name);
+            float elr = cos_lr(step, STEPS) * Chuck.dampen;
+            printf("  step %5d/%d | loss %.4f (avg %.4f) | lr %.6f\n",
+                   step+1, STEPS, lv, rl/rn, elr);
+            printf("    chuck: \xce\xbb=%.2f \xcf\x83=%.2f", Chuck.dampen, Chuck.sigma);
+            for (int l = 0; l < N_LAYER; l++) {
+                if (CL[l].frozen) printf(" | L%d: frozen", l);
+                else printf(" | L%d: %.2f", l, CL[l].dampen);
+            }
+            printf("\n    silu: %.0f%% alive | norm: %.1f | rope: %.0f%%",
+                   SiLU_eye.health * 100, Norm_eye.scale_ema, RoPE_eye.utilization * 100);
+            if (act_mag[0] > 0) {
+                printf(" | flow:");
+                for (int l = 0; l < N_LAYER; l++) printf(" %.2f%s", act_mag[l], l<N_LAYER-1?"→":"");
+            }
+            printf("\n");
             rl = 0; rn = 0;
         }
     }
@@ -480,11 +703,11 @@ static void inference(Data *data) {
         int label = s % 10, idx = label + (s/10) * 10;
         tape_reset(); kv_clear();
         int vt[N_VIS]; encode_vis(data->imgs[idx], vt);
-        for (int p = 0; p < N_VIS; p++) gpt_step(vt[p], p);
+        for (int p = 0; p < N_VIS; p++) gpt_step(vt[p], p, 0);
         int tok = BOS; char gen[MAX_TXT+1]; int gl = 0;
         for (int t = 0; t < MAX_TXT; t++) {
             int pos = N_VIS + t, te = op_embed(M.wte, tok);
-            int lg = gpt_step(te, pos);
+            int lg = gpt_step(te, pos, 0);
             tok = sample_topk(T.a[lg].data, VOCAB, TEMP, TOPK);
             if (tok == EOS || tok == BOS) break;
             if (gl < MAX_TXT) gen[gl++] = id2c(tok);
@@ -493,14 +716,22 @@ static void inference(Data *data) {
         printf("  [%d] true: %5s | gen: %-8s %s\n", label, names[label], gen, ok ? "OK" : "MISS");
     }
     printf("\n  accuracy: %d/%d (%.1f%%)\n", correct, total, 100.0f*correct/total);
+
+    /* Frozen layer report */
+    int frozen = 0;
+    for (int l = 0; l < N_LAYER; l++) if (CL[l].frozen) frozen++;
+    if (frozen > 0) printf("  chuck: %d/%d layers frozen (compute saved)\n", frozen, N_LAYER);
+
     T.on = 1;
 }
 
 int main(void) {
-    printf("micro_vlm.c v3 — Vision-Language Model in pure C\n");
-    printf("Patch tokens + RoPE + SwiGLU + Chuck (self-aware optimizer) | zero deps\n\n");
+    printf("micro_vlm.c v4 — Vision-Language Model in pure C\n");
+    printf("GQA %dQ/%dKV | %d layers | RoPE | SwiGLU | Chuck v4 (self-aware optimizer)\n",
+           N_HEAD, N_KV_HEAD, N_LAYER);
+    printf("Every component has eyes. Adam is blind. Chuck sees.\n\n");
     clock_t t0 = clock(); rseed(42);
-    tape_init(); init_model();
+    tape_init(); chuck_init(); init_model();
     printf("generating 10000 synthetic %dx%d digit images...\n", IMG_SIZE, IMG_SIZE);
     Data d = gen_data(10000); printf("done.\n");
     train(&d); inference(&d);
