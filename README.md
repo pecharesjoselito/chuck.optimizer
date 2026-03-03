@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="chuck.jpg" width="300" alt="Chuck — boot stomping the loss curve">
+  <img src="assets/chuck.jpg" width="300" alt="Chuck — boot stomping the loss curve">
 </p>
 
 # Chuck & Lee
