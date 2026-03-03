@@ -430,6 +430,7 @@ typedef struct {
 static struct {
     float hist[CHUCK_WINDOW];
     float dampen, noise, sigma;
+    float loss_ema;         /* EMA-smoothed loss (batch noise filter) */
     float psi;              /* Ψ: subjectivity signal (memory - observation) */
     float psi_w;            /* Ψ weight: trust in memory (0 → 0.3) */
     float rec_lambda;       /* λ at last memory recording */
@@ -470,7 +471,10 @@ static int param_layer(int pi) {
 
 static void chuck_step(float lr, float loss) {
     /* ═══ Level 1: Global self-awareness (loss trend) ═══ */
-    Chuck.hist[Chuck.pos % CHUCK_WINDOW] = loss;
+    /* EMA smoothing: filters batch-to-batch noise for mini-batch SGD */
+    if (Chuck.loss_ema == 0.0f) Chuck.loss_ema = loss;
+    else Chuck.loss_ema = 0.99f * Chuck.loss_ema + 0.01f * loss;
+    Chuck.hist[Chuck.pos % CHUCK_WINDOW] = Chuck.loss_ema;
     Chuck.pos++;
     if (Chuck.pos >= CHUCK_WINDOW) Chuck.full = 1;
     if (Chuck.full) {
