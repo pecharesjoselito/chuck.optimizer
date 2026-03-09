@@ -642,9 +642,10 @@ static void chuck_init(void) {
                fminf(CHUCK_PSI_CAP, (float)chuck_mem_n / ((float)chuck_mem_n + CHUCK_PSI_HALF)));
 }
 
-/* Which layer does param pi belong to? -1 = global (patch_proj, wte) */
+/* Which layer does param pi belong to? -1 = global (patch_proj, wte, w_cls) */
 static int param_layer(int pi) {
     if (pi < 2) return -1;  /* 0=patch_proj, 1=wte */
+    if (pi >= 2 + N_LAYER * 7) return -1;  /* w_cls = last param */
     return (pi - 2) / 7;     /* 7 params per layer: wq,wk,wv,wo,w1,w3,w2 */
 }
 
@@ -904,10 +905,11 @@ static Data load_cifar100(const char *path) {
 
 /* ---- Model (GQA: wk/wv use KV_DIM) ---- */
 typedef struct {
-    int patch_proj, wte;
+    int patch_proj, wte, w_cls;
     struct { int wq, wk, wv, wo, w1, w3, w2; } L[N_LAYER];
 } Model;
 static Model M;
+static int g_cls_mode = 0;  /* 0=generative, 1=classification head */
 
 static int init_w(int r, int c, float s) {
     int i = mnew(r, c);
@@ -927,6 +929,7 @@ static void init_model(void) {
         M.L[i].w3 = init_w(MLP_DIM, N_EMBD, s);            /* param 2+7i+5 */
         M.L[i].w2 = init_w(N_EMBD, MLP_DIM, s);            /* param 2+7i+6 */
     }
+    M.w_cls = init_w(N_CLASSES, N_EMBD, 0.02f);             /* classification head: (100, 256) */
     T.npa = T.na; T.aparam = T.apos;
 }
 
@@ -1139,6 +1142,108 @@ static void train(Data *data) {
 #endif
 }
 
+/* ---- Classification mode: image → class label (no text generation) ---- */
+static void train_cls(Data *data) {
+    printf("\n=== TRAINING CLS (%d steps, Chuck v7) ===\n", STEPS);
+    int tp = 0; for (int i = 0; i < T.np; i++) tp += T.a[T.par[i]].size;
+    printf("  %d params (%.2fM) | %d layers | cls head: %d×%d\n",
+           tp, tp/1000000.0f, N_LAYER, N_CLASSES, N_EMBD);
+    printf("  task: CIFAR-100 → 100 classes (direct classification)\n");
+    printf("  data: %d images\n", data->n);
+    if (g_start_step > 0) printf("  resuming from step %d\n", g_start_step);
+    printf("\n");
+    float rl = 0; int rn = 0, rc = 0;
+    for (int step = g_start_step; step < STEPS; step++) {
+        int idx = (int)(rnext() % (uint64_t)data->n);
+        int label = data->labels[idx];
+        tape_reset(); kv_clear();
+        silu_eye_reset(); rope_eye_reset(); attn_eye_reset();
+        /* Encode image patches */
+        int vt[N_VIS];
+        float *img = &data->imgs[idx * IMG_SIZE * IMG_SIZE * IMG_CH];
+        encode_vis(img, vt);
+        /* Process all patches through transformer */
+        int last_h = -1;
+        for (int p = 0; p < N_VIS; p++) last_h = gpt_step(vt[p], p, (p == N_VIS - 1));
+        /* Mean pool over all patch positions (use last position's hidden state after attention over all) */
+        /* The last position has attended to all previous patches via causal attention */
+        int cls_logits = op_mv(M.w_cls, op_rms(last_h));  /* (100,) */
+        int loss = op_ce(cls_logits, label);
+        backward(loss);
+        float lv = T.a[loss].data[0];
+        /* Check if prediction is correct */
+        float *lg = T.a[cls_logits].data; int pred = 0;
+        for (int i = 1; i < N_CLASSES; i++) if (lg[i] > lg[pred]) pred = i;
+        if (pred == label) rc++;
+        chuck_step(cos_lr(step, STEPS), lv);
+#ifdef USE_CUDA
+        if ((step + 1) % 10 == 0) cuda_sync_params();
+#endif
+        rl += lv; rn++;
+        if ((step+1) % 500 == 0) {
+            float elr = cos_lr(step, STEPS) * Chuck.dampen * Chuck.lr_scale;
+            printf("  step %5d/%d | loss %.4f (avg %.4f) | acc %.1f%% | lr %.6f\n",
+                   step+1, STEPS, lv, rl/rn, 100.0f*rc/rn, elr);
+            printf("    chuck: \xce\xbb=%.2f \xce\xa8=%+.2f (\xce\xa8w=%.2f, %d mem) \xcf\x83=%.2f macro=%.2f",
+                   Chuck.dampen, Chuck.psi, Chuck.psi_w, chuck_mem_n, Chuck.sigma, Chuck.lr_scale);
+            if (Chuck.macro_drops > 0) printf(" (%d drops)", Chuck.macro_drops);
+            for (int l = 0; l < N_LAYER; l++) {
+                if (l == 2 && N_LAYER > 5) { printf(" | ..."); l = N_LAYER - 2; continue; }
+                if (CL[l].frozen) printf(" | L%d:frz", l);
+                else printf(" | L%d:%.2f", l, CL[l].dampen);
+            }
+            printf("\n");
+            rl = 0; rn = 0; rc = 0;
+        }
+        if ((step+1) % 5000 == 0) ckpt_save(g_ckpt_path, step+1);
+    }
+    ckpt_save(g_ckpt_path, STEPS);
+#ifdef USE_CUDA
+    cuda_sync_params();
+#endif
+}
+
+static void inference_cls(Data *data) {
+    printf("\n=== INFERENCE CLS — CIFAR-100 (%d test images) ===\n\n", data->n);
+    T.on = 0; int correct = 0, total = 0;
+    int per_class_correct[N_CLASSES], per_class_total[N_CLASSES];
+    memset(per_class_correct, 0, sizeof(per_class_correct));
+    memset(per_class_total, 0, sizeof(per_class_total));
+    for (int s = 0; s < data->n; s++) {
+        int label = data->labels[s];
+        tape_reset(); kv_clear();
+        int vt[N_VIS];
+        float *img = &data->imgs[s * IMG_SIZE * IMG_SIZE * IMG_CH];
+        encode_vis(img, vt);
+        int last_h = -1;
+        for (int p = 0; p < N_VIS; p++) last_h = gpt_step(vt[p], p, 0);
+        int cls_logits = op_mv(M.w_cls, op_rms(last_h));
+        float *lg = T.a[cls_logits].data; int pred = 0;
+        for (int i = 1; i < N_CLASSES; i++) if (lg[i] > lg[pred]) pred = i;
+        int ok = (pred == label); correct += ok; total++;
+        per_class_correct[label] += ok; per_class_total[label]++;
+        if (s < 20 || (s % 1000 == 0))
+            printf("  [%5d] true: %-16s | pred: %-16s %s\n",
+                   s, cifar100_names[label], cifar100_names[pred], ok ? "OK" : "MISS");
+    }
+    printf("\n  accuracy: %d/%d (%.1f%%)\n", correct, total, 100.0f*correct/total);
+    /* Top-5 and bottom-5 classes */
+    printf("  best classes:");
+    for (int rank = 0; rank < 5; rank++) {
+        float best_acc = -1; int best_c = 0;
+        for (int c = 0; c < N_CLASSES; c++) {
+            if (per_class_total[c] == 0) continue;
+            float a = (float)per_class_correct[c] / per_class_total[c];
+            int taken = 0; (void)taken;
+            if (a > best_acc) { best_acc = a; best_c = c; }
+        }
+        printf(" %s(%.0f%%)", cifar100_names[best_c], best_acc*100);
+        per_class_total[best_c] = 0; /* exclude from next iter */
+    }
+    printf("\n");
+    T.on = 1;
+}
+
 /* ---- Sampling ---- */
 static int sample_topk(float *logits, int vocab, float temp, int topk) {
     float *sc = malloc(vocab * sizeof(float));
@@ -1206,6 +1311,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--data") == 0 && i+1 < argc) data_dir = argv[++i];
         else if (strcmp(argv[i], "--resume") == 0 && i+1 < argc) resume_path = argv[++i];
         else if (strcmp(argv[i], "--save") == 0 && i+1 < argc) save_path = argv[++i];
+        else if (strcmp(argv[i], "--cls") == 0) g_cls_mode = 1;
     }
     g_ckpt_path = save_path;
 
@@ -1254,9 +1360,15 @@ int main(int argc, char **argv) {
     Data test_data = load_cifar100(test_path);
     printf("  loaded %d test images\n\n", test_data.n);
 
-    train(&train_data);
-    if (test_data.n > 0) inference(&test_data);
-    else inference(&train_data); /* fallback: test on train if no test set */
+    if (g_cls_mode) {
+        printf("  MODE: classification head (--cls)\n\n");
+        train_cls(&train_data);
+        inference_cls(test_data.n > 0 ? &test_data : &train_data);
+    } else {
+        train(&train_data);
+        if (test_data.n > 0) inference(&test_data);
+        else inference(&train_data);
+    }
 
     printf("\ntotal: %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
     printf("chuck.mem: %d memories (%.1f KB) | \xce\xa8_w=%.3f\n",
