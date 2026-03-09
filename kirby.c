@@ -49,9 +49,10 @@
 #define PATCHES_SIDE 4
 #define N_PATCHES    16  /* 4×4 grid */
 
-#define N_CODES      512    /* codebook size — visual vocabulary */
-#define Z_DIM        64     /* latent dimension per patch */
-#define H_DIM        128    /* hidden dim in encoder/decoder */
+#define N_CODES      1024   /* codebook size — visual vocabulary */
+#define Z_DIM        128    /* latent dimension per patch */
+#define H1_DIM       672    /* hidden dim layer 1 (encoder/decoder) */
+#define H2_DIM       384    /* hidden dim layer 2 (encoder/decoder) */
 
 #define LR           0.001f
 #define BETA_COMMIT  0.25f  /* commitment loss weight */
@@ -221,33 +222,37 @@ static void codebook_ema_update(Codebook *cb, const float *z, int idx) {
         cb->embed[idx * Z_DIM + j] = cb->ema_sum[idx * Z_DIM + j] / n;
 }
 
-/* ---- VQ-VAE Model ---- */
+/* ---- VQ-VAE Model (3-layer encoder/decoder, ~1M params) ---- */
 typedef struct {
-    /* Encoder: patch(192) → h(128) → z(64) */
-    Linear enc1;  /* (H_DIM, PATCH_PX) = (128, 192) */
-    Linear enc2;  /* (Z_DIM, H_DIM)    = (64, 128)  */
-    /* Decoder: z(64) → h(128) → patch(192) */
-    Linear dec1;  /* (H_DIM, Z_DIM)    = (128, 64)  */
-    Linear dec2;  /* (PATCH_PX, H_DIM) = (192, 128) */
+    /* Encoder: patch(192) → 672 → 384 → z(128) */
+    Linear enc1;  /* (H1_DIM, PATCH_PX) = (672, 192) */
+    Linear enc2;  /* (H2_DIM, H1_DIM)   = (384, 672) */
+    Linear enc3;  /* (Z_DIM, H2_DIM)    = (128, 384) */
+    /* Decoder: z(128) → 384 → 672 → patch(192) */
+    Linear dec1;  /* (H2_DIM, Z_DIM)    = (384, 128) */
+    Linear dec2;  /* (H1_DIM, H2_DIM)   = (672, 384) */
+    Linear dec3;  /* (PATCH_PX, H1_DIM) = (192, 672) */
     /* Codebook */
     Codebook cb;
 } VQVAE;
 
 static VQVAE vqvae_new(void) {
     VQVAE m;
-    m.enc1 = linear_new(H_DIM, PATCH_PX);
-    m.enc2 = linear_new(Z_DIM, H_DIM);
-    m.dec1 = linear_new(H_DIM, Z_DIM);
-    m.dec2 = linear_new(PATCH_PX, H_DIM);
+    m.enc1 = linear_new(H1_DIM, PATCH_PX);
+    m.enc2 = linear_new(H2_DIM, H1_DIM);
+    m.enc3 = linear_new(Z_DIM, H2_DIM);
+    m.dec1 = linear_new(H2_DIM, Z_DIM);
+    m.dec2 = linear_new(H1_DIM, H2_DIM);
+    m.dec3 = linear_new(PATCH_PX, H1_DIM);
     m.cb   = codebook_new();
     return m;
 }
 
 /* Buffers for forward/backward (per patch) */
-static float enc_h[H_DIM], enc_z[Z_DIM];
-static float dec_h[H_DIM], dec_out[PATCH_PX];
-static float d_dec_out[PATCH_PX], d_dec_h[H_DIM], d_z[Z_DIM];
-static float d_enc_z[Z_DIM], d_enc_h[H_DIM];
+static float enc_h1[H1_DIM], enc_h2[H2_DIM], enc_z[Z_DIM];
+static float dec_h1[H2_DIM], dec_h2[H1_DIM], dec_out[PATCH_PX];
+static float d_dec_out[PATCH_PX], d_dec_h2[H1_DIM], d_dec_h1[H2_DIM], d_z[Z_DIM];
+static float d_enc_z[Z_DIM], d_enc_h2[H2_DIM], d_enc_h1[H1_DIM];
 
 /*
  * Train one patch through VQ-VAE.
@@ -255,48 +260,55 @@ static float d_enc_z[Z_DIM], d_enc_h[H_DIM];
  * Codebook updated via EMA. Encoder/decoder grads accumulated.
  */
 static float vqvae_train_patch(VQVAE *m, const float *patch) {
-    /* ---- Encoder ---- */
-    linear_fwd(&m->enc1, patch, enc_h);
-    relu_fwd(enc_h, H_DIM);
-    linear_fwd(&m->enc2, enc_h, enc_z);  /* z_e = encoder output */
+    /* ---- Encoder: 3 layers ---- */
+    linear_fwd(&m->enc1, patch, enc_h1);
+    relu_fwd(enc_h1, H1_DIM);
+    linear_fwd(&m->enc2, enc_h1, enc_h2);
+    relu_fwd(enc_h2, H2_DIM);
+    linear_fwd(&m->enc3, enc_h2, enc_z);  /* z_e = encoder output */
 
     /* ---- Quantize ---- */
     int code = codebook_quantize(&m->cb, enc_z);
-    float *z_q = &m->cb.embed[code * Z_DIM];  /* quantized vector */
+    float *z_q = &m->cb.embed[code * Z_DIM];
 
-    /* ---- Decoder (uses z_q, but straight-through grad goes to z_e) ---- */
-    linear_fwd(&m->dec1, z_q, dec_h);
-    relu_fwd(dec_h, H_DIM);
-    linear_fwd(&m->dec2, dec_h, dec_out);
+    /* ---- Decoder: 3 layers (uses z_q, straight-through to z_e) ---- */
+    linear_fwd(&m->dec1, z_q, dec_h1);
+    relu_fwd(dec_h1, H2_DIM);
+    linear_fwd(&m->dec2, dec_h1, dec_h2);
+    relu_fwd(dec_h2, H1_DIM);
+    linear_fwd(&m->dec3, dec_h2, dec_out);
 
     /* ---- Reconstruction loss: MSE ---- */
     float mse = 0;
     for (int i = 0; i < PATCH_PX; i++) {
         float diff = dec_out[i] - patch[i];
         mse += diff * diff;
-        d_dec_out[i] = 2.0f * diff / PATCH_PX;  /* d(MSE)/d(out) */
+        d_dec_out[i] = 2.0f * diff / PATCH_PX;
     }
     mse /= PATCH_PX;
 
     /* ---- Backward: decoder ---- */
-    memset(d_dec_h, 0, sizeof(d_dec_h));
-    linear_bwd(&m->dec2, dec_h, d_dec_out, d_dec_h);
-    /* relu backward on dec_h — need pre-relu dec_h, but we overwrote it.
-       Use post-relu: if dec_h[i]==0, grad=0 */
-    relu_bwd(dec_h, d_dec_h, H_DIM);
+    memset(d_dec_h2, 0, sizeof(d_dec_h2));
+    linear_bwd(&m->dec3, dec_h2, d_dec_out, d_dec_h2);
+    relu_bwd(dec_h2, d_dec_h2, H1_DIM);
+    memset(d_dec_h1, 0, sizeof(d_dec_h1));
+    linear_bwd(&m->dec2, dec_h1, d_dec_h2, d_dec_h1);
+    relu_bwd(dec_h1, d_dec_h1, H2_DIM);
     memset(d_z, 0, sizeof(d_z));
-    linear_bwd(&m->dec1, z_q, d_dec_h, d_z);
+    linear_bwd(&m->dec1, z_q, d_dec_h1, d_z);
 
-    /* ---- Straight-through estimator: copy d_z to encoder output ---- */
-    /* Plus commitment loss: β × ||z_e - sg(z_q)||² → grad = 2β(z_e - z_q) */
+    /* ---- Straight-through + commitment loss ---- */
     for (int j = 0; j < Z_DIM; j++)
         d_enc_z[j] = d_z[j] + 2.0f * BETA_COMMIT * (enc_z[j] - z_q[j]);
 
     /* ---- Backward: encoder ---- */
-    memset(d_enc_h, 0, sizeof(d_enc_h));
-    linear_bwd(&m->enc2, enc_h, d_enc_z, d_enc_h);
-    relu_bwd(enc_h, d_enc_h, H_DIM);  /* enc_h was already relu'd */
-    linear_bwd(&m->enc1, patch, d_enc_h, NULL);  /* don't need d_input */
+    memset(d_enc_h2, 0, sizeof(d_enc_h2));
+    linear_bwd(&m->enc3, enc_h2, d_enc_z, d_enc_h2);
+    relu_bwd(enc_h2, d_enc_h2, H2_DIM);
+    memset(d_enc_h1, 0, sizeof(d_enc_h1));
+    linear_bwd(&m->enc2, enc_h1, d_enc_h2, d_enc_h1);
+    relu_bwd(enc_h1, d_enc_h1, H1_DIM);
+    linear_bwd(&m->enc1, patch, d_enc_h1, NULL);
 
     /* ---- EMA codebook update ---- */
     codebook_ema_update(&m->cb, enc_z, code);
@@ -307,11 +319,12 @@ static float vqvae_train_patch(VQVAE *m, const float *patch) {
 /* Decode a single code index to a patch */
 static void vqvae_decode_patch(VQVAE *m, int code, float *out) {
     float *z_q = &m->cb.embed[code * Z_DIM];
-    float h[H_DIM];
-    linear_fwd(&m->dec1, z_q, h);
-    relu_fwd(h, H_DIM);
-    linear_fwd(&m->dec2, h, out);
-    /* clamp to [0,1] */
+    float h1[H2_DIM], h2[H1_DIM];
+    linear_fwd(&m->dec1, z_q, h1);
+    relu_fwd(h1, H2_DIM);
+    linear_fwd(&m->dec2, h1, h2);
+    relu_fwd(h2, H1_DIM);
+    linear_fwd(&m->dec3, h2, out);
     for (int i = 0; i < PATCH_PX; i++) {
         if (out[i] < 0) out[i] = 0;
         if (out[i] > 1) out[i] = 1;
@@ -328,11 +341,12 @@ static void vqvae_encode_image(VQVAE *m, const float *img, int *codes) {
                     for (int x = 0; x < PATCH_SIZE; x++)
                         patch[c * PATCH_SIZE * PATCH_SIZE + y * PATCH_SIZE + x] =
                             img[c * IMG_SIZE * IMG_SIZE + (py*PATCH_SIZE+y) * IMG_SIZE + px*PATCH_SIZE + x];
-            /* encode */
-            float h[H_DIM], z[Z_DIM];
-            linear_fwd(&m->enc1, patch, h);
-            relu_fwd(h, H_DIM);
-            linear_fwd(&m->enc2, h, z);
+            float h1[H1_DIM], h2[H2_DIM], z[Z_DIM];
+            linear_fwd(&m->enc1, patch, h1);
+            relu_fwd(h1, H1_DIM);
+            linear_fwd(&m->enc2, h1, h2);
+            relu_fwd(h2, H2_DIM);
+            linear_fwd(&m->enc3, h2, z);
             codes[py * PATCHES_SIDE + px] = codebook_quantize(&m->cb, z);
         }
     }
@@ -372,27 +386,30 @@ static void vqvae_decode_image(VQVAE *m, const int *codes, const char *path) {
 /* ---- Save/Load ---- */
 #define VQ_MAGIC 0x4C454556  /* "LEEV" */
 
+static void save_linear(FILE *f, Linear *l) {
+    fwrite(l->w, sizeof(float), l->rows * l->cols, f);
+    fwrite(l->b, sizeof(float), l->rows, f);
+}
+static void load_linear(FILE *f, Linear *l) {
+    fread(l->w, sizeof(float), l->rows * l->cols, f);
+    fread(l->b, sizeof(float), l->rows, f);
+}
+
 static void vqvae_save(VQVAE *m, const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) return;
     uint32_t magic = VQ_MAGIC;
     fwrite(&magic, 4, 1, f);
-    /* codebook */
     fwrite(m->cb.embed, sizeof(float), N_CODES * Z_DIM, f);
-    /* decoder weights (all Leo needs to draw) */
-    fwrite(m->dec1.w, sizeof(float), m->dec1.rows * m->dec1.cols, f);
-    fwrite(m->dec1.b, sizeof(float), m->dec1.rows, f);
-    fwrite(m->dec2.w, sizeof(float), m->dec2.rows * m->dec2.cols, f);
-    fwrite(m->dec2.b, sizeof(float), m->dec2.rows, f);
-    /* encoder weights (Lee needs to see) */
-    fwrite(m->enc1.w, sizeof(float), m->enc1.rows * m->enc1.cols, f);
-    fwrite(m->enc1.b, sizeof(float), m->enc1.rows, f);
-    fwrite(m->enc2.w, sizeof(float), m->enc2.rows * m->enc2.cols, f);
-    fwrite(m->enc2.b, sizeof(float), m->enc2.rows, f);
+    save_linear(f, &m->dec1); save_linear(f, &m->dec2); save_linear(f, &m->dec3);
+    save_linear(f, &m->enc1); save_linear(f, &m->enc2); save_linear(f, &m->enc3);
     fclose(f);
-    long bytes = 4 + (N_CODES*Z_DIM + H_DIM*Z_DIM + H_DIM + PATCH_PX*H_DIM + PATCH_PX
-                     + H_DIM*PATCH_PX + H_DIM + Z_DIM*H_DIM + Z_DIM) * 4;
-    printf("  saved %s (%.1fKB)\n", path, bytes / 1024.0f);
+    /* compute size */
+    long bytes = 4;
+    bytes += N_CODES * Z_DIM * 4;
+    Linear *layers[] = {&m->dec1, &m->dec2, &m->dec3, &m->enc1, &m->enc2, &m->enc3};
+    for (int i = 0; i < 6; i++) bytes += (layers[i]->rows * layers[i]->cols + layers[i]->rows) * 4;
+    printf("  saved %s (%.1fMB)\n", path, bytes / (1024.0f * 1024.0f));
 }
 
 static int vqvae_load(VQVAE *m, const char *path) {
@@ -401,14 +418,8 @@ static int vqvae_load(VQVAE *m, const char *path) {
     uint32_t magic; fread(&magic, 4, 1, f);
     if (magic != VQ_MAGIC) { fclose(f); return -1; }
     fread(m->cb.embed, sizeof(float), N_CODES * Z_DIM, f);
-    fread(m->dec1.w, sizeof(float), m->dec1.rows * m->dec1.cols, f);
-    fread(m->dec1.b, sizeof(float), m->dec1.rows, f);
-    fread(m->dec2.w, sizeof(float), m->dec2.rows * m->dec2.cols, f);
-    fread(m->dec2.b, sizeof(float), m->dec2.rows, f);
-    fread(m->enc1.w, sizeof(float), m->enc1.rows * m->enc1.cols, f);
-    fread(m->enc1.b, sizeof(float), m->enc1.rows, f);
-    fread(m->enc2.w, sizeof(float), m->enc2.rows * m->enc2.cols, f);
-    fread(m->enc2.b, sizeof(float), m->enc2.rows, f);
+    load_linear(f, &m->dec1); load_linear(f, &m->dec2); load_linear(f, &m->dec3);
+    load_linear(f, &m->enc1); load_linear(f, &m->enc2); load_linear(f, &m->enc3);
     fclose(f);
     printf("  loaded %s\n", path);
     return 0;
@@ -454,17 +465,17 @@ int main(int argc, char **argv) {
     }
 
     printf("kirby.c — VQ-VAE visual vocabulary (Jack Kirby drew the language)\n");
-    printf("  codebook: %d codes × %d dim | encoder/decoder hidden: %d\n", N_CODES, Z_DIM, H_DIM);
+    printf("  codebook: %d codes × %d dim | hidden: %d → %d\n", N_CODES, Z_DIM, H1_DIM, H2_DIM);
     printf("  patches: %d×%d×%d = %d per patch, %d patches per image\n",
            PATCH_SIZE, PATCH_SIZE, IMG_CH, PATCH_PX, N_PATCHES);
 
     /* count params */
-    int enc_params = H_DIM * PATCH_PX + H_DIM + Z_DIM * H_DIM + Z_DIM;
-    int dec_params = H_DIM * Z_DIM + H_DIM + PATCH_PX * H_DIM + PATCH_PX;
+    int enc_params = H1_DIM*PATCH_PX + H1_DIM + H2_DIM*H1_DIM + H2_DIM + Z_DIM*H2_DIM + Z_DIM;
+    int dec_params = H2_DIM*Z_DIM + H2_DIM + H1_DIM*H2_DIM + H1_DIM + PATCH_PX*H1_DIM + PATCH_PX;
     int cb_params = N_CODES * Z_DIM;
     int total = enc_params + dec_params + cb_params;
-    printf("  params: %d encoder + %d decoder + %d codebook = %d (%.1fK)\n",
-           enc_params, dec_params, cb_params, total, total / 1000.0f);
+    printf("  params: %d encoder + %d decoder + %d codebook = %d (%.1fM)\n",
+           enc_params, dec_params, cb_params, total, total / 1000000.0f);
 
     VQVAE model = vqvae_new();
 
@@ -531,8 +542,8 @@ int main(int argc, char **argv) {
         float step_loss = 0;
 
         /* zero grads */
-        linear_zero_grad(&model.enc1); linear_zero_grad(&model.enc2);
-        linear_zero_grad(&model.dec1); linear_zero_grad(&model.dec2);
+        linear_zero_grad(&model.enc1); linear_zero_grad(&model.enc2); linear_zero_grad(&model.enc3);
+        linear_zero_grad(&model.dec1); linear_zero_grad(&model.dec2); linear_zero_grad(&model.dec3);
 
         /* process all 16 patches */
         for (int py = 0; py < PATCHES_SIDE; py++) {
@@ -550,8 +561,8 @@ int main(int argc, char **argv) {
 
         /* Adam update */
         int t = step + 1;
-        linear_adam(&model.enc1, LR, t); linear_adam(&model.enc2, LR, t);
-        linear_adam(&model.dec1, LR, t); linear_adam(&model.dec2, LR, t);
+        linear_adam(&model.enc1, LR, t); linear_adam(&model.enc2, LR, t); linear_adam(&model.enc3, LR, t);
+        linear_adam(&model.dec1, LR, t); linear_adam(&model.dec2, LR, t); linear_adam(&model.dec3, LR, t);
 
         running_loss += step_loss; rn++;
 
